@@ -42,16 +42,6 @@ def create_app(test_config=None):
         days=term_months*30
         interest=int((Decimal(amount)*Decimal("0.003")*days).quantize(Decimal("1"),rounding=ROUND_HALF_UP))
         return days,interest,amount+interest
-    def accrue_interest(item):
-        """Post simple daily interest on outstanding principal for complete days."""
-        if not item or item["status"]!="active" or not item["interest_updated_at"]: return item
-        last=datetime.fromisoformat(item["interest_updated_at"]); days=(now()-last).days
-        if days<1: return item
-        principal=item["amount_cents"]-item["principal_repaid_cents"]
-        added=int((Decimal(principal)*Decimal("0.003")*days).quantize(Decimal("1"),rounding=ROUND_HALF_UP))
-        updated=last+timedelta(days=days)
-        db().execute("UPDATE loans SET accrued_interest_cents=accrued_interest_cents+?,interest_updated_at=? WHERE id=?",(added,updated.isoformat(),item["id"])); db().commit()
-        return db().execute("SELECT * FROM loans WHERE id=?",(item["id"],)).fetchone()
     def receipt(kind,loan_id):
         prefix={"deposit":"DP","withdrawal":"WD","repayment":"RP"}[kind]
         return f"QF{prefix}{now():%m%d%H%M}{loan_id:04d}"
@@ -112,7 +102,6 @@ def create_app(test_config=None):
     def loan(reference):
         item=find_loan(reference)
         if not item: flash("Loan not found.","error"); return redirect(url_for("dashboard"))
-        item=accrue_interest(item)
         maturity=datetime.fromisoformat(item["maturity_at"]) if item["maturity_at"] else None
         tx=db().execute("SELECT * FROM transactions WHERE loan_id=? ORDER BY id DESC",(item["id"],)).fetchall()
         principal_balance=item["amount_cents"]-item["principal_repaid_cents"]
@@ -138,21 +127,12 @@ def create_app(test_config=None):
         item=find_loan(reference); maturity=datetime.fromisoformat(item["maturity_at"]) if item and item["maturity_at"] else None; phone=request.form.get("phone","").strip()
         if not item or item["status"]!="maturing" or not maturity or now()<maturity or not phone: flash("The loan is not mature or the M-Pesa number is missing.","error"); return redirect(url_for("loan",reference=reference))
         timestamp=now(); due=timestamp+timedelta(days=item["term_months"]*30); code=receipt("withdrawal",item["id"])
-        db().execute("UPDATE loans SET status='active',withdrawn_at=?,due_at=?,interest_updated_at=? WHERE id=?",(timestamp.isoformat(),due.isoformat(),timestamp.isoformat(),item["id"])); db().execute("INSERT INTO transactions(loan_id,kind,amount_cents,mpesa_code,phone,created_at) VALUES(?,?,?,?,?,?)",(item["id"],"withdrawal",item["amount_cents"],code,phone,timestamp.isoformat())); db().commit(); flash(f"KES {money(item['amount_cents'])} sent by simulated M-Pesa. Daily interest is now active. Receipt: {code}","success"); return redirect(url_for("loan",reference=reference))
-    @app.post("/loan/<reference>/simulate-interest")
-    @protected
-    def simulate_interest(reference):
-        item=find_loan(reference)
-        if item and item["status"]=="active" and item["interest_updated_at"]:
-            days=max(1,min(365,int(request.form.get("days","1"))))
-            shifted=datetime.fromisoformat(item["interest_updated_at"])-timedelta(days=days)
-            db().execute("UPDATE loans SET interest_updated_at=? WHERE id=?",(shifted.isoformat(),item["id"])); db().commit()
-            flash(f"Demo clock advanced by {days} day(s). Interest has been added.","success")
-        return redirect(url_for("loan",reference=reference))
+        _days,full_interest,total=projected_totals(item["amount_cents"],item["term_months"])
+        db().execute("UPDATE loans SET status='active',withdrawn_at=?,due_at=?,accrued_interest_cents=? WHERE id=?",(timestamp.isoformat(),due.isoformat(),full_interest,item["id"])); db().execute("INSERT INTO transactions(loan_id,kind,amount_cents,mpesa_code,phone,created_at) VALUES(?,?,?,?,?,?)",(item["id"],"withdrawal",item["amount_cents"],code,phone,timestamp.isoformat())); db().commit(); flash(f"KES {money(item['amount_cents'])} sent by simulated M-Pesa. Total repayment is KES {money(total)}. Receipt: {code}","success"); return redirect(url_for("loan",reference=reference))
     @app.post("/loan/<reference>/repay")
     @protected
     def repay(reference):
-        item=accrue_interest(find_loan(reference))
+        item=find_loan(reference)
         if not item or item["status"]!="active": flash("This loan is not open for repayment.","error"); return redirect(url_for("dashboard"))
         principal_balance=item["amount_cents"]-item["principal_repaid_cents"]
         balance=principal_balance+item["accrued_interest_cents"]

@@ -23,10 +23,9 @@ def test_complete_mpesa_loan_lifecycle(client):
     page=client.get(location); assert b"KES 15,000.00" in page.data
     page=client.post(location+"/deposit",data={"phone":"0799999999"},follow_redirects=True); assert b"Waiting for maturity" in page.data
     page=client.post(location+"/simulate-maturity",follow_redirects=True); assert b"Loan has matured" in page.data
-    page=client.post(location+"/withdraw",data={"phone":"0712345678"},follow_redirects=True); assert b"Repay your loan" in page.data
-    page=client.post(location+"/simulate-interest",data={"days":"1"},follow_redirects=True)
-    assert b"KES 150.00" in page.data and b"KES 50,150.00" in page.data
-    page=client.post(location+"/repay",data={"phone":"0712345678","amount":"50150"},follow_redirects=True); assert b"Loan fully repaid" in page.data
+    page=client.post(location+"/withdraw",data={"phone":"0712345678"},follow_redirects=True)
+    assert b"Repay your loan" in page.data and b"KES 63,500.00" in page.data
+    page=client.post(location+"/repay",data={"phone":"0712345678","amount":"63500"},follow_redirects=True); assert b"Loan fully repaid" in page.data
     assert page.data.count(b"QF")>=4
 
 def test_term_limits_are_enforced(client):
