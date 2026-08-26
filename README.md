@@ -1,6 +1,6 @@
 # QuickFund
 
-A complete Flask loan simulation: users sign up, apply with a guarantor, simulate a 30% M-Pesa deposit, pass a 14-day maturity period, withdraw, and make partial or full repayments. Repayment terms are limited by loan size. The fixed repayment total is the principal plus 0.30% daily interest for every day in the selected term (`months × 30 days`).
+A complete Flask loan simulation: users sign up, apply with a guarantor, simulate a 30% M-Pesa deposit, pass a 14-day maturity period, withdraw, and make partial or full repayments. Repayment terms are limited by loan size. The fixed repayment total is the principal plus 0.30% daily interest for every day in the selected term (`months × 30 days`). A 0.1% withdrawal fee is deducted from the principal before the simulated M-Pesa disbursement.
 
 ## Run locally
 

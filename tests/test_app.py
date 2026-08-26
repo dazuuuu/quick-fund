@@ -25,6 +25,7 @@ def test_complete_mpesa_loan_lifecycle(client):
     page=client.post(location+"/simulate-maturity",follow_redirects=True); assert b"Loan has matured" in page.data
     page=client.post(location+"/withdraw",data={"phone":"0712345678"},follow_redirects=True)
     assert b"Repay your loan" in page.data and b"KES 63,500.00" in page.data
+    assert b"KES 49,950.00" in page.data and b"KES 50.00 withdrawal fee" in page.data
     page=client.post(location+"/repay",data={"phone":"0712345678","amount":"63500"},follow_redirects=True); assert b"Loan fully repaid" in page.data
     assert page.data.count(b"QF")>=4
 

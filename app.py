@@ -20,11 +20,11 @@ def create_app(test_config=None):
     def init_db():
         db().executescript("""
         CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,phone TEXT NOT NULL UNIQUE,email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS loans(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,reference TEXT NOT NULL UNIQUE,guarantor_name TEXT NOT NULL,guarantor_phone TEXT NOT NULL,amount_cents INTEGER NOT NULL,deposit_cents INTEGER NOT NULL,term_months INTEGER NOT NULL,purpose TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'awaiting_deposit',created_at TEXT NOT NULL,deposit_at TEXT,maturity_at TEXT,withdrawn_at TEXT,due_at TEXT,repaid_cents INTEGER NOT NULL DEFAULT 0,principal_repaid_cents INTEGER NOT NULL DEFAULT 0,accrued_interest_cents INTEGER NOT NULL DEFAULT 0,interest_updated_at TEXT,FOREIGN KEY(user_id) REFERENCES users(id));
+        CREATE TABLE IF NOT EXISTS loans(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,reference TEXT NOT NULL UNIQUE,guarantor_name TEXT NOT NULL,guarantor_phone TEXT NOT NULL,amount_cents INTEGER NOT NULL,deposit_cents INTEGER NOT NULL,term_months INTEGER NOT NULL,purpose TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'awaiting_deposit',created_at TEXT NOT NULL,deposit_at TEXT,maturity_at TEXT,withdrawn_at TEXT,due_at TEXT,repaid_cents INTEGER NOT NULL DEFAULT 0,principal_repaid_cents INTEGER NOT NULL DEFAULT 0,accrued_interest_cents INTEGER NOT NULL DEFAULT 0,withdrawal_fee_cents INTEGER NOT NULL DEFAULT 0,interest_updated_at TEXT,FOREIGN KEY(user_id) REFERENCES users(id));
         CREATE TABLE IF NOT EXISTS transactions(id INTEGER PRIMARY KEY AUTOINCREMENT,loan_id INTEGER NOT NULL,kind TEXT NOT NULL,amount_cents INTEGER NOT NULL,mpesa_code TEXT NOT NULL,phone TEXT NOT NULL,created_at TEXT NOT NULL,FOREIGN KEY(loan_id) REFERENCES loans(id));
         """)
         columns={row[1] for row in db().execute("PRAGMA table_info(loans)")}
-        migrations={"principal_repaid_cents":"INTEGER NOT NULL DEFAULT 0","accrued_interest_cents":"INTEGER NOT NULL DEFAULT 0","interest_updated_at":"TEXT"}
+        migrations={"principal_repaid_cents":"INTEGER NOT NULL DEFAULT 0","accrued_interest_cents":"INTEGER NOT NULL DEFAULT 0","withdrawal_fee_cents":"INTEGER NOT NULL DEFAULT 0","interest_updated_at":"TEXT"}
         for name,definition in migrations.items():
             if name not in columns: db().execute(f"ALTER TABLE loans ADD COLUMN {name} {definition}")
         db().commit()
@@ -42,6 +42,9 @@ def create_app(test_config=None):
         days=term_months*30
         interest=int((Decimal(amount)*Decimal("0.003")*days).quantize(Decimal("1"),rounding=ROUND_HALF_UP))
         return days,interest,amount+interest
+    def withdrawal_amounts(amount):
+        fee=int((Decimal(amount)*Decimal("0.001")).quantize(Decimal("1"),rounding=ROUND_HALF_UP))
+        return fee,amount-fee
     def receipt(kind,loan_id):
         prefix={"deposit":"DP","withdrawal":"WD","repayment":"RP"}[kind]
         return f"QF{prefix}{now():%m%d%H%M}{loan_id:04d}"
@@ -107,7 +110,8 @@ def create_app(test_config=None):
         principal_balance=item["amount_cents"]-item["principal_repaid_cents"]
         balance=principal_balance+item["accrued_interest_cents"]
         term_days,projected_interest,projected_total=projected_totals(item["amount_cents"],item["term_months"])
-        return render_template("loan.html",loan=item,maturity=maturity,matured=bool(maturity and now()>=maturity),balance=balance,principal_balance=principal_balance,transactions=tx,term_days=term_days,projected_interest=projected_interest,projected_total=projected_total)
+        withdrawal_fee,net_disbursement=withdrawal_amounts(item["amount_cents"])
+        return render_template("loan.html",loan=item,maturity=maturity,matured=bool(maturity and now()>=maturity),balance=balance,principal_balance=principal_balance,transactions=tx,term_days=term_days,projected_interest=projected_interest,projected_total=projected_total,withdrawal_fee=withdrawal_fee,net_disbursement=net_disbursement)
     @app.post("/loan/<reference>/deposit")
     @protected
     def deposit(reference):
@@ -127,8 +131,8 @@ def create_app(test_config=None):
         item=find_loan(reference); maturity=datetime.fromisoformat(item["maturity_at"]) if item and item["maturity_at"] else None; phone=request.form.get("phone","").strip()
         if not item or item["status"]!="maturing" or not maturity or now()<maturity or not phone: flash("The loan is not mature or the M-Pesa number is missing.","error"); return redirect(url_for("loan",reference=reference))
         timestamp=now(); due=timestamp+timedelta(days=item["term_months"]*30); code=receipt("withdrawal",item["id"])
-        _days,full_interest,total=projected_totals(item["amount_cents"],item["term_months"])
-        db().execute("UPDATE loans SET status='active',withdrawn_at=?,due_at=?,accrued_interest_cents=? WHERE id=?",(timestamp.isoformat(),due.isoformat(),full_interest,item["id"])); db().execute("INSERT INTO transactions(loan_id,kind,amount_cents,mpesa_code,phone,created_at) VALUES(?,?,?,?,?,?)",(item["id"],"withdrawal",item["amount_cents"],code,phone,timestamp.isoformat())); db().commit(); flash(f"KES {money(item['amount_cents'])} sent by simulated M-Pesa. Total repayment is KES {money(total)}. Receipt: {code}","success"); return redirect(url_for("loan",reference=reference))
+        _days,full_interest,total=projected_totals(item["amount_cents"],item["term_months"]); fee,net=withdrawal_amounts(item["amount_cents"])
+        db().execute("UPDATE loans SET status='active',withdrawn_at=?,due_at=?,accrued_interest_cents=?,withdrawal_fee_cents=? WHERE id=?",(timestamp.isoformat(),due.isoformat(),full_interest,fee,item["id"])); db().execute("INSERT INTO transactions(loan_id,kind,amount_cents,mpesa_code,phone,created_at) VALUES(?,?,?,?,?,?)",(item["id"],"withdrawal",net,code,phone,timestamp.isoformat())); db().commit(); flash(f"KES {money(net)} sent by simulated M-Pesa after a KES {money(fee)} withdrawal fee. Total repayment is KES {money(total)}. Receipt: {code}","success"); return redirect(url_for("loan",reference=reference))
     @app.post("/loan/<reference>/repay")
     @protected
     def repay(reference):
