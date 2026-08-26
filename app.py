@@ -20,9 +20,14 @@ def create_app(test_config=None):
     def init_db():
         db().executescript("""
         CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,phone TEXT NOT NULL UNIQUE,email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS loans(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,reference TEXT NOT NULL UNIQUE,guarantor_name TEXT NOT NULL,guarantor_phone TEXT NOT NULL,amount_cents INTEGER NOT NULL,deposit_cents INTEGER NOT NULL,term_months INTEGER NOT NULL,purpose TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'awaiting_deposit',created_at TEXT NOT NULL,deposit_at TEXT,maturity_at TEXT,withdrawn_at TEXT,due_at TEXT,repaid_cents INTEGER NOT NULL DEFAULT 0,FOREIGN KEY(user_id) REFERENCES users(id));
+        CREATE TABLE IF NOT EXISTS loans(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,reference TEXT NOT NULL UNIQUE,guarantor_name TEXT NOT NULL,guarantor_phone TEXT NOT NULL,amount_cents INTEGER NOT NULL,deposit_cents INTEGER NOT NULL,term_months INTEGER NOT NULL,purpose TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'awaiting_deposit',created_at TEXT NOT NULL,deposit_at TEXT,maturity_at TEXT,withdrawn_at TEXT,due_at TEXT,repaid_cents INTEGER NOT NULL DEFAULT 0,principal_repaid_cents INTEGER NOT NULL DEFAULT 0,accrued_interest_cents INTEGER NOT NULL DEFAULT 0,interest_updated_at TEXT,FOREIGN KEY(user_id) REFERENCES users(id));
         CREATE TABLE IF NOT EXISTS transactions(id INTEGER PRIMARY KEY AUTOINCREMENT,loan_id INTEGER NOT NULL,kind TEXT NOT NULL,amount_cents INTEGER NOT NULL,mpesa_code TEXT NOT NULL,phone TEXT NOT NULL,created_at TEXT NOT NULL,FOREIGN KEY(loan_id) REFERENCES loans(id));
-        """); db().commit()
+        """)
+        columns={row[1] for row in db().execute("PRAGMA table_info(loans)")}
+        migrations={"principal_repaid_cents":"INTEGER NOT NULL DEFAULT 0","accrued_interest_cents":"INTEGER NOT NULL DEFAULT 0","interest_updated_at":"TEXT"}
+        for name,definition in migrations.items():
+            if name not in columns: db().execute(f"ALTER TABLE loans ADD COLUMN {name} {definition}")
+        db().commit()
     def now(): return datetime.now(timezone.utc).replace(microsecond=0)
     def to_cents(value):
         amount=Decimal(value.replace(",",""))
@@ -33,6 +38,16 @@ def create_app(test_config=None):
         if amount<=10_000_000: return 7
         if amount<=25_000_000: return 9
         return 12
+    def accrue_interest(item):
+        """Post simple daily interest on outstanding principal for complete days."""
+        if not item or item["status"]!="active" or not item["interest_updated_at"]: return item
+        last=datetime.fromisoformat(item["interest_updated_at"]); days=(now()-last).days
+        if days<1: return item
+        principal=item["amount_cents"]-item["principal_repaid_cents"]
+        added=int((Decimal(principal)*Decimal("0.003")*days).quantize(Decimal("1"),rounding=ROUND_HALF_UP))
+        updated=last+timedelta(days=days)
+        db().execute("UPDATE loans SET accrued_interest_cents=accrued_interest_cents+?,interest_updated_at=? WHERE id=?",(added,updated.isoformat(),item["id"])); db().commit()
+        return db().execute("SELECT * FROM loans WHERE id=?",(item["id"],)).fetchone()
     def receipt(kind,loan_id):
         prefix={"deposit":"DP","withdrawal":"WD","repayment":"RP"}[kind]
         return f"QF{prefix}{now():%m%d%H%M}{loan_id:04d}"
@@ -93,9 +108,12 @@ def create_app(test_config=None):
     def loan(reference):
         item=find_loan(reference)
         if not item: flash("Loan not found.","error"); return redirect(url_for("dashboard"))
+        item=accrue_interest(item)
         maturity=datetime.fromisoformat(item["maturity_at"]) if item["maturity_at"] else None
         tx=db().execute("SELECT * FROM transactions WHERE loan_id=? ORDER BY id DESC",(item["id"],)).fetchall()
-        return render_template("loan.html",loan=item,maturity=maturity,matured=bool(maturity and now()>=maturity),balance=item["amount_cents"]-item["repaid_cents"],transactions=tx)
+        principal_balance=item["amount_cents"]-item["principal_repaid_cents"]
+        balance=principal_balance+item["accrued_interest_cents"]
+        return render_template("loan.html",loan=item,maturity=maturity,matured=bool(maturity and now()>=maturity),balance=balance,principal_balance=principal_balance,transactions=tx)
     @app.post("/loan/<reference>/deposit")
     @protected
     def deposit(reference):
@@ -115,19 +133,32 @@ def create_app(test_config=None):
         item=find_loan(reference); maturity=datetime.fromisoformat(item["maturity_at"]) if item and item["maturity_at"] else None; phone=request.form.get("phone","").strip()
         if not item or item["status"]!="maturing" or not maturity or now()<maturity or not phone: flash("The loan is not mature or the M-Pesa number is missing.","error"); return redirect(url_for("loan",reference=reference))
         timestamp=now(); due=timestamp+timedelta(days=item["term_months"]*30); code=receipt("withdrawal",item["id"])
-        db().execute("UPDATE loans SET status='active',withdrawn_at=?,due_at=? WHERE id=?",(timestamp.isoformat(),due.isoformat(),item["id"])); db().execute("INSERT INTO transactions(loan_id,kind,amount_cents,mpesa_code,phone,created_at) VALUES(?,?,?,?,?,?)",(item["id"],"withdrawal",item["amount_cents"],code,phone,timestamp.isoformat())); db().commit(); flash(f"KES {money(item['amount_cents'])} sent by simulated M-Pesa. Receipt: {code}","success"); return redirect(url_for("loan",reference=reference))
+        db().execute("UPDATE loans SET status='active',withdrawn_at=?,due_at=?,interest_updated_at=? WHERE id=?",(timestamp.isoformat(),due.isoformat(),timestamp.isoformat(),item["id"])); db().execute("INSERT INTO transactions(loan_id,kind,amount_cents,mpesa_code,phone,created_at) VALUES(?,?,?,?,?,?)",(item["id"],"withdrawal",item["amount_cents"],code,phone,timestamp.isoformat())); db().commit(); flash(f"KES {money(item['amount_cents'])} sent by simulated M-Pesa. Daily interest is now active. Receipt: {code}","success"); return redirect(url_for("loan",reference=reference))
+    @app.post("/loan/<reference>/simulate-interest")
+    @protected
+    def simulate_interest(reference):
+        item=find_loan(reference)
+        if item and item["status"]=="active" and item["interest_updated_at"]:
+            days=max(1,min(365,int(request.form.get("days","1"))))
+            shifted=datetime.fromisoformat(item["interest_updated_at"])-timedelta(days=days)
+            db().execute("UPDATE loans SET interest_updated_at=? WHERE id=?",(shifted.isoformat(),item["id"])); db().commit()
+            flash(f"Demo clock advanced by {days} day(s). Interest has been added.","success")
+        return redirect(url_for("loan",reference=reference))
     @app.post("/loan/<reference>/repay")
     @protected
     def repay(reference):
-        item=find_loan(reference)
+        item=accrue_interest(find_loan(reference))
         if not item or item["status"]!="active": flash("This loan is not open for repayment.","error"); return redirect(url_for("dashboard"))
-        balance=item["amount_cents"]-item["repaid_cents"]
+        principal_balance=item["amount_cents"]-item["principal_repaid_cents"]
+        balance=principal_balance+item["accrued_interest_cents"]
         try:
             amount=to_cents(request.form.get("amount",""))
             if amount>balance: raise ValueError
         except (InvalidOperation,ValueError): flash(f"Enter an amount up to KES {money(balance)}.","error"); return redirect(url_for("loan",reference=reference))
-        timestamp=now(); paid=item["repaid_cents"]+amount; status="repaid" if paid==item["amount_cents"] else "active"; code=receipt("repayment",item["id"])
-        db().execute("UPDATE loans SET repaid_cents=?,status=? WHERE id=?",(paid,status,item["id"])); db().execute("INSERT INTO transactions(loan_id,kind,amount_cents,mpesa_code,phone,created_at) VALUES(?,?,?,?,?,?)",(item["id"],"repayment",amount,code,request.form.get("phone",g.user["phone"]),timestamp.isoformat())); db().commit(); flash(f"Repayment received. M-Pesa receipt: {code}","success"); return redirect(url_for("loan",reference=reference))
+        interest_paid=min(amount,item["accrued_interest_cents"]); principal_paid=amount-interest_paid
+        new_interest=item["accrued_interest_cents"]-interest_paid; new_principal_paid=item["principal_repaid_cents"]+principal_paid; paid=item["repaid_cents"]+amount
+        status="repaid" if new_interest==0 and new_principal_paid==item["amount_cents"] else "active"; timestamp=now(); code=receipt("repayment",item["id"])
+        db().execute("UPDATE loans SET repaid_cents=?,principal_repaid_cents=?,accrued_interest_cents=?,status=?,interest_updated_at=? WHERE id=?",(paid,new_principal_paid,new_interest,status,timestamp.isoformat(),item["id"])); db().execute("INSERT INTO transactions(loan_id,kind,amount_cents,mpesa_code,phone,created_at) VALUES(?,?,?,?,?,?)",(item["id"],"repayment",amount,code,request.form.get("phone",g.user["phone"]),timestamp.isoformat())); db().commit(); flash(f"Repayment received. M-Pesa receipt: {code}","success"); return redirect(url_for("loan",reference=reference))
     with app.app_context(): init_db()
     return app
 
