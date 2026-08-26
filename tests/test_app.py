@@ -1,38 +1,38 @@
-from datetime import datetime, timezone
-
 import pytest
-
 from app import create_app
-
 
 @pytest.fixture()
 def client(tmp_path):
-    app = create_app({"TESTING": True, "DATABASE": str(tmp_path / "test.sqlite"), "SECRET_KEY": "test"})
-    return app.test_client()
+    return create_app({"TESTING":True,"DATABASE":str(tmp_path/"test.sqlite"),"SECRET_KEY":"test"}).test_client()
 
+def signup(client):
+    return client.post("/signup",data={"name":"Amina Kamau","phone":"0712345678","email":"amina@example.com","password":"secret1"},follow_redirects=True)
 
-def application_data():
-    return {"borrower_name": "Amina Kamau", "borrower_phone": "+254700000000", "borrower_email": "a@example.com", "guarantor_name": "John Kamau", "guarantor_phone": "+254711111111", "loan_amount": "100000", "purpose": "Business stock"}
+def apply(client,amount="50000",term="3"):
+    return client.post("/apply",data={"guarantor_name":"John Kamau","guarantor_phone":"0799999999","loan_amount":amount,"term_months":term,"purpose":"Business"},follow_redirects=False)
 
+def test_signup_and_login(client):
+    response=signup(client)
+    assert b"Hi, Amina" in response.data
+    client.get("/logout")
+    response=client.post("/login",data={"email":"amina@example.com","password":"secret1"},follow_redirects=True)
+    assert b"YOUR DASHBOARD" in response.data
 
-def test_application_calculates_30_percent(client):
-    response = client.post("/apply", data=application_data(), follow_redirects=True)
-    assert response.status_code == 200
-    assert b"KES 30,000.00" in response.data
-    assert b"KES 100,000.00" in response.data
+def test_complete_mpesa_loan_lifecycle(client):
+    signup(client); response=apply(client); location=response.headers["Location"]
+    page=client.get(location); assert b"KES 15,000.00" in page.data
+    page=client.post(location+"/deposit",data={"phone":"0799999999"},follow_redirects=True); assert b"Waiting for maturity" in page.data
+    page=client.post(location+"/simulate-maturity",follow_redirects=True); assert b"Loan has matured" in page.data
+    page=client.post(location+"/withdraw",data={"phone":"0712345678"},follow_redirects=True); assert b"Repay your loan" in page.data
+    page=client.post(location+"/repay",data={"phone":"0712345678","amount":"50000"},follow_redirects=True); assert b"Loan fully repaid" in page.data
+    assert page.data.count(b"QF")>=4
 
+def test_term_limits_are_enforced(client):
+    signup(client)
+    response=apply(client,"50000","7")
+    assert response.status_code==400
+    assert b"allowed repayment period" in response.data
 
-def test_confirm_deposit_starts_14_day_wait(client):
-    response = client.post("/apply", data=application_data(), follow_redirects=False)
-    location = response.headers["Location"]
-    response = client.post(location + "/confirm-deposit", follow_redirects=True)
-    assert b"14 days remaining" in response.data
-    assert b"Deposit confirmed" in response.data
-
-
-def test_invalid_amount_is_rejected(client):
-    data = application_data()
-    data["loan_amount"] = "0"
-    response = client.post("/apply", data=data)
-    assert response.status_code == 400
-    assert b"valid loan amount" in response.data
+def test_protected_dashboard_redirects(client):
+    response=client.get("/dashboard")
+    assert response.status_code==302 and "/login" in response.headers["Location"]

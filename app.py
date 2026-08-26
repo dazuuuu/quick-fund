@@ -1,168 +1,135 @@
-import os
-import sqlite3
+import os, sqlite3
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-
-from flask import Flask, abort, flash, g, redirect, render_template, request, url_for
-
+from functools import wraps
+from flask import Flask, flash, g, redirect, render_template, request, session, url_for
+from werkzeug.security import check_password_hash, generate_password_hash
 
 def create_app(test_config=None):
-    app = Flask(__name__)
-    app.config.from_mapping(
-        SECRET_KEY=os.environ.get("SECRET_KEY", "dev-change-me"),
-        DATABASE=os.path.join(app.instance_path, "quickfund.sqlite"),
-    )
-    if test_config:
-        app.config.update(test_config)
-    os.makedirs(app.instance_path, exist_ok=True)
-
-    def get_db():
+    app=Flask(__name__); app.config.from_mapping(SECRET_KEY=os.environ.get("SECRET_KEY","quickfund-demo-secret"),DATABASE=os.path.join(app.instance_path,"quickfund.sqlite"))
+    if test_config: app.config.update(test_config)
+    os.makedirs(app.instance_path,exist_ok=True)
+    def db():
         if "db" not in g:
-            g.db = sqlite3.connect(app.config["DATABASE"])
-            g.db.row_factory = sqlite3.Row
+            g.db=sqlite3.connect(app.config["DATABASE"]); g.db.row_factory=sqlite3.Row
         return g.db
-
     @app.teardown_appcontext
-    def close_db(_error=None):
-        db = g.pop("db", None)
-        if db is not None:
-            db.close()
-
+    def close(_error=None):
+        connection=g.pop("db",None)
+        if connection: connection.close()
     def init_db():
-        db = get_db()
-        db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS applications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                reference TEXT UNIQUE,
-                borrower_name TEXT NOT NULL,
-                borrower_phone TEXT NOT NULL,
-                borrower_email TEXT NOT NULL,
-                guarantor_name TEXT NOT NULL,
-                guarantor_phone TEXT NOT NULL,
-                loan_amount_cents INTEGER NOT NULL,
-                deposit_amount_cents INTEGER NOT NULL,
-                purpose TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'awaiting_deposit',
-                created_at TEXT NOT NULL,
-                deposit_confirmed_at TEXT,
-                contact_available_at TEXT
-            )
-            """
-        )
-        db.commit()
-
-    def money(cents):
-        return f"{cents / 100:,.2f}"
-
-    app.jinja_env.filters["money"] = money
-
+        db().executescript("""
+        CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,phone TEXT NOT NULL UNIQUE,email TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS loans(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,reference TEXT NOT NULL UNIQUE,guarantor_name TEXT NOT NULL,guarantor_phone TEXT NOT NULL,amount_cents INTEGER NOT NULL,deposit_cents INTEGER NOT NULL,term_months INTEGER NOT NULL,purpose TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'awaiting_deposit',created_at TEXT NOT NULL,deposit_at TEXT,maturity_at TEXT,withdrawn_at TEXT,due_at TEXT,repaid_cents INTEGER NOT NULL DEFAULT 0,FOREIGN KEY(user_id) REFERENCES users(id));
+        CREATE TABLE IF NOT EXISTS transactions(id INTEGER PRIMARY KEY AUTOINCREMENT,loan_id INTEGER NOT NULL,kind TEXT NOT NULL,amount_cents INTEGER NOT NULL,mpesa_code TEXT NOT NULL,phone TEXT NOT NULL,created_at TEXT NOT NULL,FOREIGN KEY(loan_id) REFERENCES loans(id));
+        """); db().commit()
+    def now(): return datetime.now(timezone.utc).replace(microsecond=0)
+    def to_cents(value):
+        amount=Decimal(value.replace(",",""))
+        if amount<=0: raise InvalidOperation
+        return int((amount*100).quantize(Decimal("1"),rounding=ROUND_HALF_UP))
+    def max_term(amount):
+        if amount<=5_000_000: return 3
+        if amount<=10_000_000: return 7
+        if amount<=25_000_000: return 9
+        return 12
+    def receipt(kind,loan_id):
+        prefix={"deposit":"DP","withdrawal":"WD","repayment":"RP"}[kind]
+        return f"QF{prefix}{now():%m%d%H%M}{loan_id:04d}"
+    def protected(view):
+        @wraps(view)
+        def wrapped(*args,**kwargs):
+            if not g.user: flash("Please log in to continue.","error"); return redirect(url_for("login"))
+            return view(*args,**kwargs)
+        return wrapped
+    @app.before_request
+    def load_user():
+        uid=session.get("user_id"); g.user=db().execute("SELECT * FROM users WHERE id=?",(uid,)).fetchone() if uid else None
+    @app.template_filter("money")
+    def money(value): return f"{value/100:,.2f}"
     @app.context_processor
-    def inject_now():
-        return {"today": datetime.now().year}
-
+    def context(): return {"today":now().year}
     @app.get("/")
-    def index():
-        return render_template("index.html")
-
-    @app.route("/apply", methods=("GET", "POST"))
+    def index(): return render_template("index.html")
+    @app.route("/signup",methods=("GET","POST"))
+    def signup():
+        if request.method=="POST":
+            name=request.form.get("name","").strip(); phone=request.form.get("phone","").strip(); email=request.form.get("email","").strip().lower(); password=request.form.get("password","")
+            if not name or not phone or "@" not in email or len(password)<6: flash("Enter valid details and a password of at least 6 characters.","error")
+            else:
+                try:
+                    password_hash=generate_password_hash(password,method="pbkdf2:sha256")
+                    cur=db().execute("INSERT INTO users(name,phone,email,password_hash,created_at) VALUES(?,?,?,?,?)",(name,phone,email,password_hash,now().isoformat())); db().commit(); session.clear(); session["user_id"]=cur.lastrowid
+                    flash("Account created. Welcome to QuickFund!","success"); return redirect(url_for("dashboard"))
+                except sqlite3.IntegrityError: flash("That email or phone is already registered.","error")
+        return render_template("auth.html",mode="signup")
+    @app.route("/login",methods=("GET","POST"))
+    def login():
+        if request.method=="POST":
+            user=db().execute("SELECT * FROM users WHERE email=?",(request.form.get("email","").strip().lower(),)).fetchone()
+            if user and check_password_hash(user["password_hash"],request.form.get("password","")): session.clear(); session["user_id"]=user["id"]; return redirect(url_for("dashboard"))
+            flash("Incorrect email or password.","error")
+        return render_template("auth.html",mode="login")
+    @app.get("/logout")
+    def logout(): session.clear(); return redirect(url_for("index"))
+    def find_loan(ref): return db().execute("SELECT * FROM loans WHERE reference=? AND user_id=?",(ref.upper(),g.user["id"])).fetchone()
+    @app.get("/dashboard")
+    @protected
+    def dashboard(): return render_template("dashboard.html",loans=db().execute("SELECT * FROM loans WHERE user_id=? ORDER BY id DESC",(g.user["id"],)).fetchall())
+    @app.route("/apply",methods=("GET","POST"))
+    @protected
     def apply():
-        values = request.form
-        if request.method == "POST":
-            required = (
-                "borrower_name", "borrower_phone", "borrower_email",
-                "guarantor_name", "guarantor_phone", "loan_amount", "purpose",
-            )
-            if any(not values.get(field, "").strip() for field in required):
-                flash("Please complete every field.", "error")
-                return render_template("apply.html", values=values), 400
+        if request.method=="POST":
             try:
-                amount = Decimal(values["loan_amount"].replace(",", ""))
-                if amount <= 0:
-                    raise InvalidOperation
-            except (InvalidOperation, ValueError):
-                flash("Enter a valid loan amount greater than zero.", "error")
-                return render_template("apply.html", values=values), 400
-
-            amount_cents = int((amount * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-            deposit_cents = int((Decimal(amount_cents) * Decimal("0.30")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-            now = datetime.now(timezone.utc).replace(microsecond=0)
-            db = get_db()
-            cursor = db.execute(
-                """INSERT INTO applications
-                (borrower_name, borrower_phone, borrower_email, guarantor_name,
-                 guarantor_phone, loan_amount_cents, deposit_amount_cents, purpose, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    values["borrower_name"].strip(), values["borrower_phone"].strip(),
-                    values["borrower_email"].strip(), values["guarantor_name"].strip(),
-                    values["guarantor_phone"].strip(), amount_cents, deposit_cents,
-                    values["purpose"].strip(), now.isoformat(),
-                ),
-            )
-            application_id = cursor.lastrowid
-            reference = f"QF-{now:%Y%m%d}-{application_id:05d}"
-            db.execute("UPDATE applications SET reference = ? WHERE id = ?", (reference, application_id))
-            db.commit()
-            return redirect(url_for("application_status", reference=reference))
-        return render_template("apply.html", values=values)
-
-    def find_application(reference):
-        row = get_db().execute(
-            "SELECT * FROM applications WHERE reference = ?", (reference.upper(),)
-        ).fetchone()
-        if row is None:
-            abort(404)
-        return row
-
-    @app.get("/application/<reference>")
-    def application_status(reference):
-        application = find_application(reference)
-        available = None
-        days_left = None
-        if application["contact_available_at"]:
-            available = datetime.fromisoformat(application["contact_available_at"])
-            delta = available - datetime.now(timezone.utc)
-            days_left = max(0, (delta.days + (1 if delta.seconds else 0)))
-        return render_template(
-            "status.html", application=application, available=available, days_left=days_left
-        )
-
-    @app.post("/application/<reference>/confirm-deposit")
-    def confirm_deposit(reference):
-        application = find_application(reference)
-        if application["status"] == "awaiting_deposit":
-            confirmed = datetime.now(timezone.utc).replace(microsecond=0)
-            available = confirmed + timedelta(days=14)
-            get_db().execute(
-                """UPDATE applications SET status = 'waiting_period',
-                deposit_confirmed_at = ?, contact_available_at = ? WHERE id = ?""",
-                (confirmed.isoformat(), available.isoformat(), application["id"]),
-            )
-            get_db().commit()
-            flash("Deposit confirmed. The 14-day waiting period has started.", "success")
-        return redirect(url_for("application_status", reference=reference))
-
-    @app.route("/track", methods=("GET", "POST"))
-    def track():
-        if request.method == "POST":
-            reference = request.form.get("reference", "").strip().upper()
-            if reference:
-                exists = get_db().execute(
-                    "SELECT 1 FROM applications WHERE reference = ?", (reference,)
-                ).fetchone()
-                if exists:
-                    return redirect(url_for("application_status", reference=reference))
-            flash("We could not find that application reference.", "error")
-        return render_template("track.html")
-
-    with app.app_context():
-        init_db()
+                amount=to_cents(request.form.get("loan_amount","")); term=int(request.form.get("term_months","0")); guarantor=request.form.get("guarantor_name","").strip(); phone=request.form.get("guarantor_phone","").strip(); purpose=request.form.get("purpose","").strip()
+                if term<1 or term>max_term(amount) or not guarantor or not phone or not purpose: raise ValueError
+            except (InvalidOperation,ValueError,TypeError): flash("Complete all fields with a valid amount and allowed repayment period.","error"); return render_template("apply.html",values=request.form),400
+            timestamp=now(); deposit=(amount*30+50)//100
+            cur=db().execute("INSERT INTO loans(user_id,reference,guarantor_name,guarantor_phone,amount_cents,deposit_cents,term_months,purpose,created_at) VALUES(?,?,?,?,?,?,?,?,?)",(g.user["id"],f"TEMP-{timestamp.timestamp()}",guarantor,phone,amount,deposit,term,purpose,timestamp.isoformat()))
+            ref=f"QF-{timestamp:%Y%m%d}-{cur.lastrowid:05d}"; db().execute("UPDATE loans SET reference=? WHERE id=?",(ref,cur.lastrowid)); db().commit(); return redirect(url_for("loan",reference=ref))
+        return render_template("apply.html",values={})
+    @app.get("/loan/<reference>")
+    @protected
+    def loan(reference):
+        item=find_loan(reference)
+        if not item: flash("Loan not found.","error"); return redirect(url_for("dashboard"))
+        maturity=datetime.fromisoformat(item["maturity_at"]) if item["maturity_at"] else None
+        tx=db().execute("SELECT * FROM transactions WHERE loan_id=? ORDER BY id DESC",(item["id"],)).fetchall()
+        return render_template("loan.html",loan=item,maturity=maturity,matured=bool(maturity and now()>=maturity),balance=item["amount_cents"]-item["repaid_cents"],transactions=tx)
+    @app.post("/loan/<reference>/deposit")
+    @protected
+    def deposit(reference):
+        item=find_loan(reference); phone=request.form.get("phone","").strip()
+        if not item or item["status"]!="awaiting_deposit" or not phone: flash("Enter a valid guarantor M-Pesa number.","error"); return redirect(url_for("loan",reference=reference))
+        timestamp=now(); code=receipt("deposit",item["id"]); maturity=timestamp+timedelta(days=14)
+        db().execute("UPDATE loans SET status='maturing',deposit_at=?,maturity_at=? WHERE id=?",(timestamp.isoformat(),maturity.isoformat(),item["id"])); db().execute("INSERT INTO transactions(loan_id,kind,amount_cents,mpesa_code,phone,created_at) VALUES(?,?,?,?,?,?)",(item["id"],"deposit",item["deposit_cents"],code,phone,timestamp.isoformat())); db().commit(); flash(f"Simulated M-Pesa deposit successful. Receipt: {code}","success"); return redirect(url_for("loan",reference=reference))
+    @app.post("/loan/<reference>/simulate-maturity")
+    @protected
+    def simulate_maturity(reference):
+        item=find_loan(reference)
+        if item and item["status"]=="maturing": db().execute("UPDATE loans SET maturity_at=? WHERE id=?",((now()-timedelta(seconds=1)).isoformat(),item["id"])); db().commit(); flash("Demo clock advanced. The loan is ready to withdraw.","success")
+        return redirect(url_for("loan",reference=reference))
+    @app.post("/loan/<reference>/withdraw")
+    @protected
+    def withdraw(reference):
+        item=find_loan(reference); maturity=datetime.fromisoformat(item["maturity_at"]) if item and item["maturity_at"] else None; phone=request.form.get("phone","").strip()
+        if not item or item["status"]!="maturing" or not maturity or now()<maturity or not phone: flash("The loan is not mature or the M-Pesa number is missing.","error"); return redirect(url_for("loan",reference=reference))
+        timestamp=now(); due=timestamp+timedelta(days=item["term_months"]*30); code=receipt("withdrawal",item["id"])
+        db().execute("UPDATE loans SET status='active',withdrawn_at=?,due_at=? WHERE id=?",(timestamp.isoformat(),due.isoformat(),item["id"])); db().execute("INSERT INTO transactions(loan_id,kind,amount_cents,mpesa_code,phone,created_at) VALUES(?,?,?,?,?,?)",(item["id"],"withdrawal",item["amount_cents"],code,phone,timestamp.isoformat())); db().commit(); flash(f"KES {money(item['amount_cents'])} sent by simulated M-Pesa. Receipt: {code}","success"); return redirect(url_for("loan",reference=reference))
+    @app.post("/loan/<reference>/repay")
+    @protected
+    def repay(reference):
+        item=find_loan(reference)
+        if not item or item["status"]!="active": flash("This loan is not open for repayment.","error"); return redirect(url_for("dashboard"))
+        balance=item["amount_cents"]-item["repaid_cents"]
+        try:
+            amount=to_cents(request.form.get("amount",""))
+            if amount>balance: raise ValueError
+        except (InvalidOperation,ValueError): flash(f"Enter an amount up to KES {money(balance)}.","error"); return redirect(url_for("loan",reference=reference))
+        timestamp=now(); paid=item["repaid_cents"]+amount; status="repaid" if paid==item["amount_cents"] else "active"; code=receipt("repayment",item["id"])
+        db().execute("UPDATE loans SET repaid_cents=?,status=? WHERE id=?",(paid,status,item["id"])); db().execute("INSERT INTO transactions(loan_id,kind,amount_cents,mpesa_code,phone,created_at) VALUES(?,?,?,?,?,?)",(item["id"],"repayment",amount,code,request.form.get("phone",g.user["phone"]),timestamp.isoformat())); db().commit(); flash(f"Repayment received. M-Pesa receipt: {code}","success"); return redirect(url_for("loan",reference=reference))
+    with app.app_context(): init_db()
     return app
 
-
-app = create_app()
-
-
-if __name__ == "__main__":
-    app.run(debug=True)
+app=create_app()
+if __name__=="__main__": app.run(debug=True)

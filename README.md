@@ -1,6 +1,6 @@
 # QuickFund
 
-A Flask loan application prototype. A guarantor secures an application with a 30% deposit, after which the system enforces a minimum 14-day communication waiting period.
+A complete Flask loan simulation: users sign up, apply with a guarantor, simulate a 30% M-Pesa deposit, pass a 14-day maturity period, withdraw, and make partial or full repayments. Repayment terms are limited by loan size.
 
 ## Run locally
 
