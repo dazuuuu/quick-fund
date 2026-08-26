@@ -35,6 +35,12 @@ def test_term_limits_are_enforced(client):
     assert response.status_code==400
     assert b"allowed repayment period" in response.data
 
+def test_application_has_automatic_full_term_total(client):
+    signup(client)
+    page=client.get("/apply")
+    assert b"PROJECTED TOTAL REPAYMENT" in page.data
+    assert b"principal+charge" in page.data
+
 def test_protected_dashboard_redirects(client):
     response=client.get("/dashboard")
     assert response.status_code==302 and "/login" in response.headers["Location"]

@@ -38,6 +38,10 @@ def create_app(test_config=None):
         if amount<=10_000_000: return 7
         if amount<=25_000_000: return 9
         return 12
+    def projected_totals(amount,term_months):
+        days=term_months*30
+        interest=int((Decimal(amount)*Decimal("0.003")*days).quantize(Decimal("1"),rounding=ROUND_HALF_UP))
+        return days,interest,amount+interest
     def accrue_interest(item):
         """Post simple daily interest on outstanding principal for complete days."""
         if not item or item["status"]!="active" or not item["interest_updated_at"]: return item
@@ -113,7 +117,8 @@ def create_app(test_config=None):
         tx=db().execute("SELECT * FROM transactions WHERE loan_id=? ORDER BY id DESC",(item["id"],)).fetchall()
         principal_balance=item["amount_cents"]-item["principal_repaid_cents"]
         balance=principal_balance+item["accrued_interest_cents"]
-        return render_template("loan.html",loan=item,maturity=maturity,matured=bool(maturity and now()>=maturity),balance=balance,principal_balance=principal_balance,transactions=tx)
+        term_days,projected_interest,projected_total=projected_totals(item["amount_cents"],item["term_months"])
+        return render_template("loan.html",loan=item,maturity=maturity,matured=bool(maturity and now()>=maturity),balance=balance,principal_balance=principal_balance,transactions=tx,term_days=term_days,projected_interest=projected_interest,projected_total=projected_total)
     @app.post("/loan/<reference>/deposit")
     @protected
     def deposit(reference):
