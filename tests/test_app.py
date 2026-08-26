@@ -44,3 +44,13 @@ def test_application_has_automatic_full_term_total(client):
 def test_protected_dashboard_redirects(client):
     response=client.get("/dashboard")
     assert response.status_code==302 and "/login" in response.headers["Location"]
+
+def test_user_can_apply_again_and_dashboard_tracks_both(client):
+    signup(client)
+    first=apply(client)
+    assert first.status_code==302
+    second=apply(client,"100000","7")
+    assert second.status_code==302
+    page=client.get("/dashboard")
+    assert page.data.count(b"QF-")>=2
+    assert b"Loan packages" in page.data and b"Transaction history" in page.data

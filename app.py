@@ -87,7 +87,21 @@ def create_app(test_config=None):
     def find_loan(ref): return db().execute("SELECT * FROM loans WHERE reference=? AND user_id=?",(ref.upper(),g.user["id"])).fetchone()
     @app.get("/dashboard")
     @protected
-    def dashboard(): return render_template("dashboard.html",loans=db().execute("SELECT * FROM loans WHERE user_id=? ORDER BY id DESC",(g.user["id"],)).fetchall())
+    def dashboard():
+        loans=db().execute("SELECT * FROM loans WHERE user_id=? ORDER BY id DESC",(g.user["id"],)).fetchall()
+        transactions=db().execute("""SELECT transactions.*,loans.reference FROM transactions
+            JOIN loans ON loans.id=transactions.loan_id WHERE loans.user_id=?
+            ORDER BY transactions.id DESC LIMIT 20""",(g.user["id"],)).fetchall()
+        total_borrowed=sum(item["amount_cents"] for item in loans if item["withdrawn_at"])
+        total_paid=sum(item["repaid_cents"] for item in loans)
+        total_balance=sum(max(0,item["amount_cents"]+item["accrued_interest_cents"]-item["repaid_cents"]) for item in loans if item["status"] in ("active","repaid"))
+        packages=[
+            {"name":"Starter","limit":"Up to KES 50,000","months":3,"rate":"0.30% daily"},
+            {"name":"Growth","limit":"Up to KES 100,000","months":7,"rate":"0.30% daily"},
+            {"name":"Business","limit":"Up to KES 250,000","months":9,"rate":"0.30% daily"},
+            {"name":"Enterprise","limit":"Above KES 250,000","months":12,"rate":"0.30% daily"},
+        ]
+        return render_template("dashboard.html",loans=loans,transactions=transactions,total_borrowed=total_borrowed,total_paid=total_paid,total_balance=total_balance,packages=packages)
     @app.route("/apply",methods=("GET","POST"))
     @protected
     def apply():
